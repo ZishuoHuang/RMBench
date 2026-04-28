@@ -1,37 +1,54 @@
-# if you want to modify the config, please check the following tutorial first:
-# https://robotwin-platform.github.io/doc/usage/configurations.html
 render_freq: 0
-episode_num: 50
-use_seed: false
+episode_num: 5
+use_seed: true
 save_freq: 15
-embodiment: ["aloha-agilex"]
-language_num: 1
+embodiment:
+- aloha-agilex
+language_num: 100
 domain_randomization:
-  random_background: false
-  cluttered_table: false
+  random_background: true
+  cluttered_table: true
   clean_background_rate: 1
   random_head_camera_dis: 0
   random_table_height: 0
   random_light: false
   crazy_random_light_rate: 0
 camera:
-  head_camera_type: LargeView
-  wrist_camera_type: LargeView
+  head_camera_type: Custom_832x480
+  wrist_camera_type: Custom_832x480
+  world_camera1_width: 832
+  world_camera1_height: 480
   collect_head_camera: true
-  collect_wrist_camera: true
+  collect_wrist_camera: false
+  collect_world_camera: true
+  collect_observer_camera: false
+  record_single_camera: true
+  record_camera_name: world_camera1
+  random_camera_candidates_file: task_config/camera_candidates/aloha-agilex_random_camera_world_camera1.yml
 data_type:
   rgb: true
-  third_view: true
-  depth: false
+  third_view: false
+  depth: true
   pointcloud: false
   observer: false
   endpose: true
   qpos: true
   mesh_segmentation: false
-  actor_segmentation: false
+  actor_segmentation: true
+segmentation_level: actor
 pcd_down_sample_num: 1024
 pcd_crop: true
 save_path: ./data
 clear_cache_freq: 5
+video_fps: 16.0
 collect_data: true
 eval_video_log: true
+h5_export:
+  enable: true
+  strip_rgb: true
+  strip_extrinsic: false
+  export_depth: true
+  export_intrinsic: true
+  export_cam_pose: true
+  export_segmentation: true
+  strip_segmentation: true

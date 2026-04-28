@@ -11,6 +11,7 @@ import json
 import transforms3d as t3d
 from collections import OrderedDict
 import torch, random
+import yaml
 
 from .utils import *
 import math
@@ -23,6 +24,7 @@ from pathlib import Path
 import trimesh
 import imageio
 import glob
+import h5py
 
 
 from ._GLOBAL_CONFIGS import *
@@ -63,13 +65,15 @@ class Base_Task(gym.Env):
         self.task_name = kwags.get("task_name")
         self.save_dir = kwags.get("save_path", "data")
         self.ep_num = kwags.get("now_ep_num", 0)
+        self.video_fps = float(kwags.get("video_fps", 30.0))
         self.render_freq = kwags.get("render_freq", 10)
         self.data_type = kwags.get("data_type", None)
         self.save_data = kwags.get("save_data", False)
         self.dual_arm = kwags.get("dual_arm", True)
         self.eval_mode = kwags.get("eval_mode", False)
 
-        self.need_topp = True  # TODO
+        # MPlib TOPP path can segfault on some driver/library combos; keep it optional.
+        self.need_topp = kwags.get("need_topp", os.getenv("ROBOTWIN_NEED_TOPP", "0") == "1")
 
         # Random
         random_setting = kwags.get("domain_randomization")
@@ -102,6 +106,33 @@ class Base_Task(gym.Env):
         self.save_freq = kwags.get("save_freq")
         self.world_pcd = None
 
+        camera_cfg = kwags.get("camera", {})
+        self.record_single_camera = bool(camera_cfg.get("record_single_camera", False))
+        self.record_camera_name = camera_cfg.get("record_camera_name", "world_camera1")
+        self.random_camera_candidates = camera_cfg.get("random_camera_candidates", [])
+        self.random_camera_candidates_file = camera_cfg.get("random_camera_candidates_file")
+        self.random_camera_candidates = self._load_random_camera_candidates(
+            self.random_camera_candidates,
+            self.random_camera_candidates_file,
+        )
+        self.selected_camera_name = self.record_camera_name
+
+        # Keep only one segmentation level for downstream flow generation.
+        self.segmentation_level = str(kwags.get("segmentation_level", "actor")).lower()
+        if self.segmentation_level not in ("actor", "mesh"):
+            self.segmentation_level = "actor"
+
+        h5_export_cfg = kwags.get("h5_export", {})
+        self.enable_h5_sidecar_export = bool(h5_export_cfg.get("enable", False))
+        self.strip_h5_rgb = bool(h5_export_cfg.get("strip_rgb", True))
+        # Keep camera poses in HDF5 by default. RGB/depth/seg remain sidecar-first.
+        self.strip_h5_extrinsic = bool(h5_export_cfg.get("strip_extrinsic", False))
+        self.export_h5_depth_to_sidecar = bool(h5_export_cfg.get("export_depth", True))
+        self.export_h5_intrinsic_to_sidecar = bool(h5_export_cfg.get("export_intrinsic", True))
+        self.export_h5_cam_pose_to_sidecar = bool(h5_export_cfg.get("export_cam_pose", True))
+        self.export_h5_segmentation_to_sidecar = bool(h5_export_cfg.get("export_segmentation", True))
+        self.strip_h5_segmentation = bool(h5_export_cfg.get("strip_segmentation", True))
+
         self.size_dict = list()
         self.cluttered_objs = list()
         self.prohibited_area = list()  # [x_min, y_min, x_max, y_max]
@@ -115,14 +146,12 @@ class Base_Task(gym.Env):
         self.left_cnt = 0
         self.right_cnt = 0
 
-        self.is_dual_arm = kwags['dual_arm'] if 'dual_arm' in kwags else True
-        kwags['dual_arm'] = self.is_dual_arm
-
         self.instruction = None  # for Eval
 
         self.create_table_and_wall(table_xy_bias=table_xy_bias, table_height=0.74)
         self.load_robot(**kwags)
         self.load_camera(**kwags)
+        self._apply_camera_sampling_policy()
         self.robot.move_to_homestate()
 
         render_freq = self.render_freq
@@ -132,8 +161,6 @@ class Base_Task(gym.Env):
 
         self.robot.set_origin_endpose()
         self.load_actors()
-        
-        self.language_annotation, self.language_annotation_cache = [], 0
 
         if self.cluttered_table:
             self.get_cluttered_table()
@@ -162,7 +189,6 @@ class Base_Task(gym.Env):
         self.info["info"] = {}
 
         self.stage_success_tag = False
-        self.max_reward = 0
 
     def check_stable(self):
         actors_list, actors_pose_list = [], []
@@ -217,10 +243,14 @@ class Base_Task(gym.Env):
         # give renderer to sapien sim
         self.engine.set_renderer(self.renderer)
 
-        sapien.render.set_camera_shader_dir("rt")
-        sapien.render.set_ray_tracing_samples_per_pixel(32)
-        sapien.render.set_ray_tracing_path_depth(8)
-        sapien.render.set_ray_tracing_denoiser("oidn")
+        # --------- Fix for A100 Server (No Hardware RT Cores) ---------
+        # Disable Ray Tracing to avoid CUDA/Vulkan crashes or extreme slowness.
+        # SAPIEN will fallback to the default standard rasterization ("deferred").
+        # sapien.render.set_camera_shader_dir("rt")
+        # sapien.render.set_ray_tracing_samples_per_pixel(32)
+        # sapien.render.set_ray_tracing_path_depth(8)
+        # sapien.render.set_ray_tracing_denoiser("oidn")
+        # --------------------------------------------------------------
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()
@@ -282,20 +312,28 @@ class Base_Task(gym.Env):
         if self.random_background:
             texture_type = "seen" if not self.eval_mode else "unseen"
             directory_path = f"./assets/background_texture/{texture_type}"
-            file_count = len(
-                [name for name in os.listdir(directory_path) if os.path.isfile(os.path.join(directory_path, name))])
+            if not os.path.isdir(directory_path):
+                print(f"[WARN] Background texture dir missing: {directory_path}. Fallback to clean background.")
+                self.wall_texture, self.table_texture = None, None
+            else:
+                file_count = len(
+                    [name for name in os.listdir(directory_path) if os.path.isfile(os.path.join(directory_path, name))])
 
-            # wall_texture, table_texture = random.randint(0, file_count - 1), random.randint(0, file_count - 1)
-            wall_texture, table_texture = np.random.randint(0, file_count), np.random.randint(0, file_count)
+                if file_count <= 0:
+                    print(f"[WARN] No background textures found in: {directory_path}. Fallback to clean background.")
+                    self.wall_texture, self.table_texture = None, None
+                else:
+                    # wall_texture, table_texture = random.randint(0, file_count - 1), random.randint(0, file_count - 1)
+                    wall_texture, table_texture = np.random.randint(0, file_count), np.random.randint(0, file_count)
 
-            self.wall_texture, self.table_texture = (
-                f"{texture_type}/{wall_texture}",
-                f"{texture_type}/{table_texture}",
-            )
-            if np.random.rand() <= self.clean_background_rate:
-                self.wall_texture = None
-            if np.random.rand() <= self.clean_background_rate:
-                self.table_texture = None
+                    self.wall_texture, self.table_texture = (
+                        f"{texture_type}/{wall_texture}",
+                        f"{texture_type}/{table_texture}",
+                    )
+                    if np.random.rand() <= self.clean_background_rate:
+                        self.wall_texture = None
+                    if np.random.rand() <= self.clean_background_rate:
+                        self.table_texture = None
         else:
             self.wall_texture, self.table_texture = None, None
 
@@ -401,11 +439,9 @@ class Base_Task(gym.Env):
         for link in self.robot.left_entity.get_links():
             link: sapien.physx.PhysxArticulationLinkComponent = link
             link.set_mass(1)
-            
-        if self.is_dual_arm:
-            for link in self.robot.right_entity.get_links():
-                link: sapien.physx.PhysxArticulationLinkComponent = link
-                link.set_mass(1)
+        for link in self.robot.right_entity.get_links():
+            link: sapien.physx.PhysxArticulationLinkComponent = link
+            link.set_mass(1)
 
     def load_camera(self, **kwags):
         """
@@ -422,6 +458,689 @@ class Base_Task(gym.Env):
         self.scene.step()  # run a physical step
         self.scene.update_render()  # sync pose from SAPIEN to renderer
 
+    def _pose_to_matrix(self, pose):
+        return pose.to_transformation_matrix().astype(np.float32)
+
+    def _collect_task_related_scope(self):
+        rigid_actor_names = set()
+        articulation_links = {}
+
+        ignore_rigid_names = {"", "ground", "table", "wall"}
+
+        for actor in self.scene.get_all_actors():
+            actor_name = actor.get_name()
+            if actor_name in ignore_rigid_names:
+                continue
+            rigid_actor_names.add(actor_name)
+
+        left_entity = getattr(getattr(self, "robot", None), "left_entity", None)
+        right_entity = getattr(getattr(self, "robot", None), "right_entity", None)
+        if left_entity is not None and hasattr(left_entity, "get_links"):
+            articulation_links["left_robot"] = {link.get_name() for link in left_entity.get_links()}
+        if right_entity is not None and hasattr(right_entity, "get_links"):
+            articulation_links["right_robot"] = {link.get_name() for link in right_entity.get_links()}
+
+        get_all_articulations = getattr(self.scene, "get_all_articulations", None)
+        if callable(get_all_articulations):
+            for idx, articulation in enumerate(get_all_articulations()):
+                art_name = getattr(articulation, "get_name", lambda: "")()
+                if not art_name:
+                    art_name = f"articulation_{idx}"
+                links = {link.get_name() for link in articulation.get_links()}
+                if links:
+                    articulation_links[art_name] = links
+
+        return rigid_actor_names, articulation_links
+
+    def _collect_rigid_actor_poses(self):
+        actor_poses = {}
+        allowed_rigid, _ = self._collect_task_related_scope()
+        for actor in self.scene.get_all_actors():
+            actor_name = actor.get_name()
+            if actor_name not in allowed_rigid:
+                continue
+            actor_poses[actor_name] = self._pose_to_matrix(actor.get_pose())
+        return actor_poses
+
+    def _collect_articulation_link_poses(self):
+        articulation_poses = {}
+        candidates = []
+
+        # Explicitly include robot arms so per-link poses are always recorded.
+        left_entity = getattr(getattr(self, "robot", None), "left_entity", None)
+        right_entity = getattr(getattr(self, "robot", None), "right_entity", None)
+        if left_entity is not None and hasattr(left_entity, "get_links"):
+            candidates.append(("left_robot", left_entity))
+        if right_entity is not None and hasattr(right_entity, "get_links"):
+            candidates.append(("right_robot", right_entity))
+
+        for key, value in self.__dict__.items():
+            if isinstance(value, ArticulationActor):
+                art = value.actor
+                art_name = getattr(art, "get_name", lambda: "")()
+                candidates.append((art_name if art_name else key, art))
+            elif hasattr(value, "get_links") and hasattr(value, "get_qpos") and hasattr(value, "get_name"):
+                candidates.append((value.get_name(), value))
+
+        get_all_articulations = getattr(self.scene, "get_all_articulations", None)
+        if callable(get_all_articulations):
+            for idx, articulation in enumerate(get_all_articulations()):
+                art_name = getattr(articulation, "get_name", lambda: f"articulation_{idx}")()
+                candidates.append((art_name if art_name else f"articulation_{idx}", articulation))
+
+        seen_articulations = set()
+        seen_obj_names = {}
+        for art_name, articulation in candidates:
+            obj_id = id(articulation)
+            seen_key = (obj_id, str(art_name))
+            if seen_key in seen_articulations:
+                continue
+
+            prior_names = seen_obj_names.get(obj_id, set())
+            special_alias = {"left_robot", "right_robot"}
+            if prior_names:
+                # Keep both left/right aliases if present; skip other duplicate aliases
+                # for the same underlying articulation object.
+                if str(art_name) not in special_alias:
+                    continue
+                if str(art_name) in prior_names:
+                    continue
+
+            seen_articulations.add(seen_key)
+            seen_obj_names.setdefault(obj_id, set()).add(str(art_name))
+
+            if not art_name:
+                art_name = getattr(articulation, "get_name", lambda: "")() or "articulation"
+
+            key_name = art_name
+            if key_name in articulation_poses:
+                sid_candidates = []
+                for link in articulation.get_links():
+                    sid = self._get_entity_scene_id(link)
+                    if sid is not None:
+                        sid_candidates.append(int(sid))
+                if sid_candidates:
+                    key_name = f"{art_name}__sid_{min(sid_candidates):06d}"
+                else:
+                    key_name = f"{art_name}__dup_{len(articulation_poses)}"
+                while key_name in articulation_poses:
+                    key_name = f"{key_name}_x"
+
+            link_poses = {}
+            for link in articulation.get_links():
+                link_name = link.get_name()
+                link_poses[link_name] = self._pose_to_matrix(link.get_pose())
+            if not link_poses:
+                continue
+            articulation_poses[key_name] = link_poses
+
+        return articulation_poses
+
+    def _collect_gripper_contacts(self):
+        contacts_by_arm = {"left": [], "right": []}
+        gripper_names = set(getattr(self.robot, "gripper_name", []))
+
+        for contact in self.scene.get_contacts():
+            body0 = contact.bodies[0].entity.name
+            body1 = contact.bodies[1].entity.name
+
+            if body0 in gripper_names:
+                gripper_body, other_body = body0, body1
+            elif body1 in gripper_names:
+                gripper_body, other_body = body1, body0
+            else:
+                continue
+
+            if "left" in gripper_body:
+                arm_key = "left"
+            elif "right" in gripper_body:
+                arm_key = "right"
+            else:
+                continue
+
+            contacts_by_arm[arm_key].append(f"{gripper_body}->{other_body}")
+
+        return {arm_key: ";".join(sorted(set(values))) for arm_key, values in contacts_by_arm.items()}
+
+    def _collect_gripper_contacts_detailed(self):
+        details = {"left": [], "right": []}
+        gripper_names = set(getattr(self.robot, "gripper_name", []))
+        sid_map = self._collect_sid_to_body_key_map()
+
+        for contact in self.scene.get_contacts():
+            body0_comp = contact.bodies[0]
+            body1_comp = contact.bodies[1]
+
+            body0_name = body0_comp.entity.name
+            body1_name = body1_comp.entity.name
+
+            if body0_name in gripper_names:
+                gripper_name, other_comp, other_name = body0_name, body1_comp, body1_name
+            elif body1_name in gripper_names:
+                gripper_name, other_comp, other_name = body1_name, body0_comp, body0_name
+            else:
+                continue
+
+            if "left" in gripper_name:
+                arm_key = "left"
+            elif "right" in gripper_name:
+                arm_key = "right"
+            else:
+                continue
+
+            other_sid = self._get_entity_scene_id(other_comp)
+            other_body_key = sid_map.get(int(other_sid), "") if other_sid is not None else ""
+
+            mesh_key_hint = ""
+            if other_sid is not None and isinstance(other_body_key, str):
+                if other_body_key.startswith("art::"):
+                    seg = other_body_key.split("::", 2)
+                    if len(seg) == 3:
+                        mesh_key_hint = f"task_articulation/sid_{int(other_sid):06d}/{seg[1]}/{seg[2]}"
+                elif other_body_key.startswith("rigid::"):
+                    seg = other_body_key.split("::", 1)
+                    if len(seg) == 2:
+                        mesh_key_hint = f"task_actor/sid_{int(other_sid):06d}/{seg[1]}"
+
+            details[arm_key].append(
+                {
+                    "gripper_body": gripper_name,
+                    "other_body": other_name,
+                    "other_scene_id": int(other_sid) if other_sid is not None else -1,
+                    "other_body_key": other_body_key,
+                    "mesh_key_hint": mesh_key_hint,
+                }
+            )
+
+        # Deduplicate while preserving order.
+        deduped = {"left": [], "right": []}
+        for arm_key in ["left", "right"]:
+            seen = set()
+            for item in details[arm_key]:
+                sig = (
+                    item["gripper_body"],
+                    item["other_body"],
+                    item["other_scene_id"],
+                    item["mesh_key_hint"],
+                )
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                deduped[arm_key].append(item)
+        return deduped
+
+    def _collect_sid_to_body_key_map(self):
+        sid_map = {}
+        allowed_rigid, _ = self._collect_task_related_scope()
+
+        for actor in self.scene.get_all_actors():
+            actor_name = actor.get_name()
+            if actor_name not in allowed_rigid:
+                continue
+            sid = self._get_entity_scene_id(actor)
+            if sid is None:
+                continue
+            sid_map[int(sid)] = f"rigid::{actor_name}"
+
+        get_all_articulations = getattr(self.scene, "get_all_articulations", None)
+        if callable(get_all_articulations):
+            used_names = set()
+            for idx, articulation in enumerate(get_all_articulations()):
+                art_name = getattr(articulation, "get_name", lambda: "")()
+                if not art_name:
+                    art_name = f"articulation_{idx}"
+
+                key_name = art_name
+                if key_name in used_names:
+                    sid_candidates = []
+                    for link in articulation.get_links():
+                        sid = self._get_entity_scene_id(link)
+                        if sid is not None:
+                            sid_candidates.append(int(sid))
+                    if sid_candidates:
+                        key_name = f"{art_name}__sid_{min(sid_candidates):06d}"
+                    else:
+                        key_name = f"{art_name}__dup_{idx}"
+                    while key_name in used_names:
+                        key_name = f"{key_name}_x"
+                used_names.add(key_name)
+
+                for link in articulation.get_links():
+                    link_name = link.get_name()
+                    sid = self._get_entity_scene_id(link)
+                    if sid is None:
+                        continue
+                    sid_map[int(sid)] = f"art::{key_name}::{link_name}"
+
+        return sid_map
+
+    def _get_entity_scene_id(self, entity):
+        fn = getattr(entity, "get_per_scene_id", None)
+        if callable(fn):
+            try:
+                return int(fn())
+            except Exception:
+                pass
+
+        val = getattr(entity, "per_scene_id", None)
+        if val is not None:
+            try:
+                return int(val)
+            except Exception:
+                pass
+
+        ent = getattr(entity, "entity", None)
+        ent_val = getattr(ent, "per_scene_id", None) if ent is not None else None
+        if ent_val is not None:
+            try:
+                return int(ent_val)
+            except Exception:
+                pass
+
+        return None
+
+    def _merge_collision_mesh_from_entity(self, entity):
+        vertices_all = []
+        faces_all = []
+        vertex_offset = 0
+
+        def _build_box_mesh(half_size):
+            hx, hy, hz = [float(x) for x in np.asarray(half_size, dtype=np.float32).reshape(3)]
+            verts = np.array(
+                [
+                    [-hx, -hy, -hz],
+                    [-hx, -hy, hz],
+                    [-hx, hy, -hz],
+                    [-hx, hy, hz],
+                    [hx, -hy, -hz],
+                    [hx, -hy, hz],
+                    [hx, hy, -hz],
+                    [hx, hy, hz],
+                ],
+                dtype=np.float32,
+            )
+            tris = np.array(
+                [
+                    [0, 1, 3], [0, 3, 2],
+                    [4, 6, 7], [4, 7, 5],
+                    [0, 4, 5], [0, 5, 1],
+                    [2, 3, 7], [2, 7, 6],
+                    [0, 2, 6], [0, 6, 4],
+                    [1, 5, 7], [1, 7, 3],
+                ],
+                dtype=np.int32,
+            )
+            return verts, tris
+
+        def _build_cylinder_mesh(radius, half_length, segments=32):
+            r = float(radius)
+            h = float(half_length)
+            n = max(8, int(segments))
+
+            angles = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+            ys = r * np.cos(angles)
+            zs = r * np.sin(angles)
+
+            left_ring = np.stack([np.full(n, -h, dtype=np.float32), ys, zs], axis=1)
+            right_ring = np.stack([np.full(n, h, dtype=np.float32), ys, zs], axis=1)
+
+            verts = [left_ring, right_ring, np.array([[-h, 0.0, 0.0], [h, 0.0, 0.0]], dtype=np.float32)]
+            verts = np.concatenate(verts, axis=0)
+
+            left_center = 2 * n
+            right_center = 2 * n + 1
+            tris = []
+
+            for i in range(n):
+                j = (i + 1) % n
+                li, lj = i, j
+                ri, rj = n + i, n + j
+
+                # Side wall.
+                tris.append([li, ri, rj])
+                tris.append([li, rj, lj])
+
+                # End caps.
+                tris.append([left_center, lj, li])
+                tris.append([right_center, ri, rj])
+
+            return verts.astype(np.float32), np.asarray(tris, dtype=np.int32)
+
+        def _build_sphere_mesh(radius, lat_steps=12, lon_steps=24):
+            r = float(radius)
+            lat_steps = max(4, int(lat_steps))
+            lon_steps = max(8, int(lon_steps))
+
+            verts = []
+            for i in range(lat_steps + 1):
+                theta = np.pi * i / lat_steps
+                x = r * np.cos(theta)
+                rr = r * np.sin(theta)
+                for j in range(lon_steps):
+                    phi = 2.0 * np.pi * j / lon_steps
+                    y = rr * np.cos(phi)
+                    z = rr * np.sin(phi)
+                    verts.append([x, y, z])
+            verts = np.asarray(verts, dtype=np.float32)
+
+            tris = []
+            for i in range(lat_steps):
+                for j in range(lon_steps):
+                    nj = (j + 1) % lon_steps
+                    a = i * lon_steps + j
+                    b = i * lon_steps + nj
+                    c = (i + 1) * lon_steps + j
+                    d = (i + 1) * lon_steps + nj
+                    if i != 0:
+                        tris.append([a, c, b])
+                    if i != lat_steps - 1:
+                        tris.append([b, c, d])
+            return verts, np.asarray(tris, dtype=np.int32)
+
+        def _build_capsule_mesh(radius, half_length, segments=24):
+            # Approximate capsule as cylinder + sphere-like end caps.
+            cyl_v, cyl_f = _build_cylinder_mesh(radius, half_length, segments=segments)
+            sph_v, sph_f = _build_sphere_mesh(radius, lat_steps=10, lon_steps=segments)
+
+            left = sph_v.copy()
+            right = sph_v.copy()
+            left[:, 0] -= float(half_length)
+            right[:, 0] += float(half_length)
+
+            v = np.concatenate([cyl_v, left, right], axis=0)
+            off1 = len(cyl_v)
+            off2 = off1 + len(left)
+            f = np.concatenate([cyl_f, sph_f + off1, sph_f + off2], axis=0)
+            return v.astype(np.float32), f.astype(np.int32)
+
+        def _build_shape_mesh_fallback(shape):
+            shape_type = type(shape).__name__
+
+            try:
+                if "Box" in shape_type:
+                    get_half_size = getattr(shape, "get_half_size", None)
+                    half_size = get_half_size() if callable(get_half_size) else getattr(shape, "half_size", None)
+                    if half_size is not None:
+                        return _build_box_mesh(half_size)
+
+                if "Cylinder" in shape_type:
+                    get_radius = getattr(shape, "get_radius", None)
+                    get_half_length = getattr(shape, "get_half_length", None)
+                    radius = get_radius() if callable(get_radius) else getattr(shape, "radius", None)
+                    half_length = get_half_length() if callable(get_half_length) else getattr(shape, "half_length", None)
+                    if radius is not None and half_length is not None:
+                        return _build_cylinder_mesh(radius, half_length)
+
+                if "Sphere" in shape_type:
+                    get_radius = getattr(shape, "get_radius", None)
+                    radius = get_radius() if callable(get_radius) else getattr(shape, "radius", None)
+                    if radius is not None:
+                        return _build_sphere_mesh(radius)
+
+                if "Capsule" in shape_type:
+                    get_radius = getattr(shape, "get_radius", None)
+                    get_half_length = getattr(shape, "get_half_length", None)
+                    radius = get_radius() if callable(get_radius) else getattr(shape, "radius", None)
+                    half_length = get_half_length() if callable(get_half_length) else getattr(shape, "half_length", None)
+                    if radius is not None and half_length is not None:
+                        return _build_capsule_mesh(radius, half_length)
+            except Exception:
+                return None, None
+
+            return None, None
+
+        shape_sources = []
+
+        # Prefer entity-level components when available.
+        if hasattr(entity, "components"):
+            shape_sources.extend(list(getattr(entity, "components", [])))
+        get_components = getattr(entity, "get_components", None)
+        if callable(get_components):
+            try:
+                shape_sources.extend(list(get_components()))
+            except Exception:
+                pass
+
+        # Some wrappers expose a backing sapien.Entity via `.entity`.
+        owner_entity = getattr(entity, "entity", None)
+        if owner_entity is not None:
+            shape_sources.append(owner_entity)
+            if hasattr(owner_entity, "components"):
+                shape_sources.extend(list(getattr(owner_entity, "components", [])))
+            owner_get_components = getattr(owner_entity, "get_components", None)
+            if callable(owner_get_components):
+                try:
+                    shape_sources.extend(list(owner_get_components()))
+                except Exception:
+                    pass
+
+        shape_sources.append(entity)
+
+        for source in shape_sources:
+            get_collision_shapes = getattr(source, "get_collision_shapes", None)
+            if not callable(get_collision_shapes):
+                continue
+
+            try:
+                shapes = get_collision_shapes()
+            except Exception:
+                continue
+
+            for shape in shapes:
+                get_vertices = getattr(shape, "get_vertices", None)
+                get_triangles = getattr(shape, "get_triangles", None)
+                if callable(get_vertices) and callable(get_triangles):
+                    try:
+                        verts = np.asarray(get_vertices(), dtype=np.float32)
+                        tris = np.asarray(get_triangles(), dtype=np.int32)
+                    except Exception:
+                        verts, tris = _build_shape_mesh_fallback(shape)
+                else:
+                    verts, tris = _build_shape_mesh_fallback(shape)
+
+                if verts is None or tris is None:
+                    continue
+
+                if verts.ndim != 2 or verts.shape[1] != 3 or len(verts) == 0:
+                    continue
+                if tris.ndim != 2 or tris.shape[1] != 3 or len(tris) == 0:
+                    continue
+
+                get_scale = getattr(shape, "get_scale", None)
+                if callable(get_scale):
+                    try:
+                        scale = np.asarray(get_scale(), dtype=np.float32).reshape(1, 3)
+                        verts = verts * scale
+                    except Exception:
+                        pass
+
+                get_local_pose = getattr(shape, "get_local_pose", None)
+                if callable(get_local_pose):
+                    try:
+                        local_pose = get_local_pose().to_transformation_matrix().astype(np.float32)
+                        verts = verts @ local_pose[:3, :3].T + local_pose[:3, 3]
+                    except Exception:
+                        pass
+
+                vertices_all.append(verts)
+                faces_all.append(tris + vertex_offset)
+                vertex_offset += verts.shape[0]
+
+        if not vertices_all:
+            return None, None
+
+        return np.concatenate(vertices_all, axis=0), np.concatenate(faces_all, axis=0)
+
+    def _collect_task_and_robot_mesh_entities(self):
+        entities = {}
+
+        def _put_entity(mesh_key, entity, category):
+            sid = self._get_entity_scene_id(entity)
+            if sid is None:
+                return
+            dedupe_key = (int(sid), category)
+            if dedupe_key in entities:
+                return
+            entities[dedupe_key] = {
+                "mesh_key": mesh_key,
+                "entity": entity,
+                "scene_id": int(sid),
+                "category": category,
+            }
+
+        for actor in self.scene.get_all_actors():
+            actor_name = actor.get_name()
+            if actor_name in {"", "ground", "table", "wall"}:
+                continue
+            sid = self._get_entity_scene_id(actor)
+            if sid is None:
+                continue
+            safe_name = actor_name if actor_name else "unnamed"
+            mesh_key = f"task_actor/sid_{int(sid):06d}/{safe_name}"
+            _put_entity(mesh_key, actor, "task_actor")
+
+        get_all_articulations = getattr(self.scene, "get_all_articulations", None)
+        if callable(get_all_articulations):
+            for idx, articulation in enumerate(get_all_articulations()):
+                art_name = getattr(articulation, "get_name", lambda: "")()
+                if not art_name:
+                    art_name = f"articulation_{idx}"
+                for link in articulation.get_links():
+                    link_name = link.get_name()
+                    sid = self._get_entity_scene_id(link)
+                    if sid is None:
+                        continue
+                    mesh_key = f"task_articulation/sid_{int(sid):06d}/{art_name}/{link_name}"
+                    _put_entity(mesh_key, link, "task_articulation_link")
+
+        # Also include articulation wrappers referenced on the task instance,
+        # which is important when scene articulation enumeration is incomplete.
+        for key, value in self.__dict__.items():
+            if isinstance(value, ArticulationActor):
+                art = value.actor
+            elif hasattr(value, "get_links") and hasattr(value, "get_qpos") and hasattr(value, "get_name"):
+                art = value
+            else:
+                continue
+
+            art_name = getattr(art, "get_name", lambda: "")()
+            if not art_name:
+                art_name = key
+
+            for link in art.get_links():
+                sid = self._get_entity_scene_id(link)
+                if sid is None:
+                    continue
+                link_name = link.get_name()
+                mesh_key = f"task_articulation/sid_{int(sid):06d}/{art_name}/{link_name}"
+                _put_entity(mesh_key, link, "task_articulation_link")
+
+        return list(entities.values())
+
+    def _append_mesh_to_episode_hdf5(self, hdf5_path):
+        mesh_entities = self._collect_task_and_robot_mesh_entities()
+
+        with h5py.File(hdf5_path, "a") as f:
+            scene_state_group = f.require_group("scene_state")
+            if "mesh" in scene_state_group:
+                del scene_state_group["mesh"]
+            mesh_group = scene_state_group.create_group("mesh")
+
+            saved_count = 0
+            for item in mesh_entities:
+                vertices, faces = self._merge_collision_mesh_from_entity(item["entity"])
+                if vertices is None or faces is None:
+                    # Keep a placeholder entry so links without extractable geometry
+                    # are still represented in mesh metadata.
+                    vertices = np.zeros((0, 3), dtype=np.float32)
+                    faces = np.zeros((0, 3), dtype=np.int32)
+                    mesh_status = "empty"
+                else:
+                    mesh_status = "ok"
+
+                safe_key = item["mesh_key"].replace("/", "__")
+                entry_group = mesh_group.create_group(safe_key)
+                entry_group.create_dataset("vertices", data=vertices.astype(np.float32), compression="gzip")
+                entry_group.create_dataset("faces", data=faces.astype(np.int32), compression="gzip")
+                entry_group.attrs["mesh_key"] = item["mesh_key"]
+                entry_group.attrs["category"] = item["category"]
+                entry_group.attrs["scene_id"] = int(item["scene_id"])
+                entry_group.attrs["mesh_status"] = mesh_status
+                saved_count += 1
+
+            mesh_group.attrs["entity_count"] = int(saved_count)
+            mesh_group.attrs["scope"] = "task_objects_and_robot_links"
+
+    def _export_camera_sidecar_and_strip_hdf5(self, hdf5_path):
+        sidecar_root = os.path.splitext(hdf5_path)[0] + "_npy"
+
+        with h5py.File(hdf5_path, "r+") as f:
+            if "observation" not in f:
+                return
+
+            obs_group = f["observation"]
+            for camera_name in list(obs_group.keys()):
+                if self.record_single_camera and camera_name != self.selected_camera_name:
+                    continue
+                camera_group = obs_group[camera_name]
+                if not isinstance(camera_group, h5py.Group):
+                    continue
+
+                camera_sidecar_dir = os.path.join(sidecar_root, "observation", camera_name)
+                os.makedirs(camera_sidecar_dir, exist_ok=True)
+
+                # 1) Save camera pose outside HDF5; remove extrinsics from HDF5.
+                if self.export_h5_cam_pose_to_sidecar and "cam2world_gl" in camera_group:
+                    cam_pose = camera_group["cam2world_gl"][...]
+                    np.save(os.path.join(camera_sidecar_dir, "cam2world_gl.npy"), cam_pose)
+
+                if self.strip_h5_extrinsic and "cam2world_gl" in camera_group:
+                    del camera_group["cam2world_gl"]
+
+                if self.strip_h5_extrinsic and "extrinsic_cv" in camera_group:
+                    del camera_group["extrinsic_cv"]
+
+                # 2) Save depth outside HDF5.
+                if self.export_h5_depth_to_sidecar and "depth" in camera_group:
+                    depth_video = camera_group["depth"][...]
+                    np.save(os.path.join(camera_sidecar_dir, "depth.npy"), depth_video)
+
+                if self.export_h5_depth_to_sidecar and "depth" in camera_group:
+                    del camera_group["depth"]
+
+                # 3) Save intrinsic outside HDF5.
+                if self.export_h5_intrinsic_to_sidecar and "intrinsic_cv" in camera_group:
+                    intrinsic = camera_group["intrinsic_cv"][...]
+                    np.save(os.path.join(camera_sidecar_dir, "intrinsic_cv.npy"), intrinsic)
+
+                if self.export_h5_intrinsic_to_sidecar and "intrinsic_cv" in camera_group:
+                    del camera_group["intrinsic_cv"]
+
+                # 4) Keep mp4 video but remove rgb from HDF5.
+                if self.strip_h5_rgb and "rgb" in camera_group:
+                    del camera_group["rgb"]
+
+                # 5) Export chosen segmentation and strip segmentation datasets from HDF5.
+                if self.export_h5_segmentation_to_sidecar:
+                    if self.segmentation_level == "mesh":
+                        if "mesh_segmentation_raw" in camera_group:
+                            seg = camera_group["mesh_segmentation_raw"][...]
+                            np.save(os.path.join(camera_sidecar_dir, "seg.npy"), seg)
+                    else:
+                        if "actor_segmentation_raw" in camera_group:
+                            seg = camera_group["actor_segmentation_raw"][...]
+                            np.save(os.path.join(camera_sidecar_dir, "seg.npy"), seg)
+
+                if self.strip_h5_segmentation:
+                    for seg_key in [
+                        "actor_segmentation",
+                        "actor_segmentation_raw",
+                        "mesh_segmentation",
+                        "mesh_segmentation_raw",
+                    ]:
+                        if seg_key in camera_group:
+                            del camera_group[seg_key]
+
     # =========================================================== Sapien ===========================================================
 
     def _update_render(self):
@@ -437,11 +1156,147 @@ class Base_Task(gym.Env):
             now_ambient_light = self.scene.ambient_light
             now_ambient_light = np.clip(np.array(now_ambient_light) + np.random.rand(3) * 0.2 - 0.1, 0, 1)
             self.scene.set_ambient_light(now_ambient_light)
-        if not self.is_dual_arm:
-            self.cameras.update_wrist_camera(self.robot.left_camera.get_pose())
-        else:
-            self.cameras.update_wrist_camera(self.robot.left_camera.get_pose(), self.robot.right_camera.get_pose())
+        self.cameras.update_wrist_camera(self.robot.left_camera.get_pose(), self.robot.right_camera.get_pose())
         self.scene.update_render()
+
+    def _resolve_camera_handle(self, camera_name):
+        if camera_name == "left_camera":
+            return getattr(self.cameras, "left_camera", None)
+        if camera_name == "right_camera":
+            return getattr(self.cameras, "right_camera", None)
+        if camera_name == "observer_camera":
+            return getattr(self.cameras, "observer_camera", None)
+        if camera_name == "world_camera1":
+            return getattr(self.cameras, "world_camera1", None)
+        if camera_name == "world_camera2":
+            return getattr(self.cameras, "world_camera2", None)
+
+        static_names = getattr(self.cameras, "static_camera_name", [])
+        static_list = getattr(self.cameras, "static_camera_list", [])
+        for cam, name in zip(static_list, static_names):
+            if name == camera_name:
+                return cam
+        return None
+
+    def _load_random_camera_candidates(self, inline_candidates, candidates_file):
+        """
+        Load camera candidates from an external file if provided.
+
+        File format supports either:
+        1) a list of candidate dicts, or
+        2) a dict containing key `random_camera_candidates`.
+        """
+        fallback = inline_candidates if isinstance(inline_candidates, list) else []
+        if not candidates_file:
+            return fallback
+
+        file_path = str(candidates_file)
+        if not os.path.isabs(file_path):
+            file_path = os.path.abspath(file_path)
+        if not os.path.exists(file_path):
+            print(f"[WARN] random_camera_candidates_file not found: {file_path}")
+            return fallback
+
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            with open(file_path, "r", encoding="utf-8") as f:
+                if ext == ".json":
+                    raw = json.load(f)
+                else:
+                    raw = yaml.safe_load(f)
+        except Exception as e:
+            print(f"[WARN] Failed to load random camera candidates file {file_path}: {e}")
+            return fallback
+
+        if isinstance(raw, dict):
+            loaded = raw.get("random_camera_candidates", [])
+        elif isinstance(raw, list):
+            loaded = raw
+        else:
+            loaded = []
+
+        valid = []
+        for item in loaded:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name", self.record_camera_name)
+            pos = item.get("position")
+            forward = item.get("forward")
+            left = item.get("left")
+            if not (isinstance(pos, (list, tuple)) and isinstance(forward, (list, tuple)) and isinstance(left, (list, tuple))):
+                continue
+            if len(pos) != 3 or len(forward) != 3 or len(left) != 3:
+                continue
+            valid.append(
+                {
+                    "name": str(name),
+                    "position": [float(x) for x in pos],
+                    "forward": [float(x) for x in forward],
+                    "left": [float(x) for x in left],
+                }
+            )
+
+        if len(valid) == 0:
+            print(f"[WARN] No valid candidates in {file_path}, fallback to inline candidates")
+            return fallback
+
+        print(f"[INFO] Loaded {len(valid)} camera candidates from {file_path}")
+        return valid
+
+    def _set_camera_pose_from_vectors(self, camera, position, forward, left):
+        cam_pos = np.asarray(position, dtype=np.float32)
+        cam_forward = np.asarray(forward, dtype=np.float32)
+        cam_left = np.asarray(left, dtype=np.float32)
+
+        if np.linalg.norm(cam_forward) < 1e-6 or np.linalg.norm(cam_left) < 1e-6:
+            return
+
+        cam_forward = cam_forward / np.linalg.norm(cam_forward)
+        cam_left = cam_left / np.linalg.norm(cam_left)
+        cam_up = np.cross(cam_forward, cam_left)
+        if np.linalg.norm(cam_up) < 1e-6:
+            return
+        cam_up = cam_up / np.linalg.norm(cam_up)
+
+        mat44 = np.eye(4, dtype=np.float32)
+        mat44[:3, :3] = np.stack([cam_forward, cam_left, cam_up], axis=1)
+        mat44[:3, 3] = cam_pos
+        camera.entity.set_pose(sapien.Pose(mat44))
+
+    def _apply_camera_sampling_policy(self):
+        if self.record_single_camera:
+            self.selected_camera_name = self.record_camera_name
+
+        if len(self.random_camera_candidates) == 0:
+            return
+
+        chosen = random.choice(self.random_camera_candidates)
+        chosen_name = chosen.get("name", self.record_camera_name)
+        cam = self._resolve_camera_handle(chosen_name)
+        if cam is None:
+            return
+
+        if (
+            "position" not in chosen
+            or "forward" not in chosen
+            or "left" not in chosen
+        ):
+            return
+
+        self._set_camera_pose_from_vectors(
+            cam,
+            chosen["position"],
+            chosen["forward"],
+            chosen["left"],
+        )
+        self.selected_camera_name = chosen_name
+
+    def _filter_camera_map(self, camera_map):
+        if not self.record_single_camera:
+            return camera_map
+        if self.selected_camera_name not in camera_map:
+            return {}
+        return {self.selected_camera_name: camera_map[self.selected_camera_name]}
 
     # =========================================================== Basic APIs ===========================================================
 
@@ -453,65 +1308,84 @@ class Base_Task(gym.Env):
             "pointcloud": [],
             "joint_action": {},
             "endpose": {},
+            "scene_state": {},
         }
 
-        pkl_dic["observation"] = self.cameras.get_config()
+        pkl_dic["observation"] = self._filter_camera_map(self.cameras.get_config())
+        pkl_dic["scene_state"]["rigid_actor_poses"] = self._collect_rigid_actor_poses()
+        pkl_dic["scene_state"]["articulation_link_poses"] = self._collect_articulation_link_poses()
+        pkl_dic["scene_state"]["gripper_contacts"] = self._collect_gripper_contacts()
+        pkl_dic["scene_state"]["gripper_contacts_detailed_json"] = json.dumps(
+            self._collect_gripper_contacts_detailed(),
+            ensure_ascii=True,
+        )
+        pkl_dic["scene_state"]["sid_to_body_key_json"] = json.dumps(
+            self._collect_sid_to_body_key_map(),
+            ensure_ascii=True,
+        )
+        pkl_dic["scene_state"]["selected_camera_name"] = self.selected_camera_name
         # rgb
         if self.data_type.get("rgb", False):
-            rgb = self.cameras.get_rgb()
+            rgb = self._filter_camera_map(self.cameras.get_rgb())
             for camera_name in rgb.keys():
                 pkl_dic["observation"][camera_name].update(rgb[camera_name])
 
         if self.data_type.get("third_view", False):
-            third_view_rgb = self.cameras.get_third_view_rgb()
+            third_view_rgb = self.cameras.get_observer_rgb()
             pkl_dic["third_view_rgb"] = third_view_rgb
-        # mesh_segmentation
-        if self.data_type.get("mesh_segmentation", False):
-            mesh_segmentation = self.cameras.get_segmentation(level="mesh")
-            for camera_name in mesh_segmentation.keys():
-                pkl_dic["observation"][camera_name].update(mesh_segmentation[camera_name])
-        # actor_segmentation
-        if self.data_type.get("actor_segmentation", False):
-            actor_segmentation = self.cameras.get_segmentation(level="actor")
-            for camera_name in actor_segmentation.keys():
-                pkl_dic["observation"][camera_name].update(actor_segmentation[camera_name])
+        # segmentation: keep only one level to avoid redundant storage.
+        if self.segmentation_level == "mesh":
+            if self.data_type.get("mesh_segmentation", False):
+                mesh_segmentation = self._filter_camera_map(self.cameras.get_segmentation(level="mesh"))
+                for camera_name in mesh_segmentation.keys():
+                    pkl_dic["observation"][camera_name].update(mesh_segmentation[camera_name])
+                mesh_segmentation_raw = self._filter_camera_map(
+                    self.cameras.get_segmentation(level="mesh", return_raw=True)
+                )
+                for camera_name in mesh_segmentation_raw.keys():
+                    pkl_dic["observation"][camera_name]["mesh_segmentation_raw"] = (
+                        mesh_segmentation_raw[camera_name]["mesh_segmentation"]
+                    )
+        else:
+            if self.data_type.get("actor_segmentation", False):
+                actor_segmentation = self._filter_camera_map(self.cameras.get_segmentation(level="actor"))
+                for camera_name in actor_segmentation.keys():
+                    pkl_dic["observation"][camera_name].update(actor_segmentation[camera_name])
+                actor_segmentation_raw = self._filter_camera_map(
+                    self.cameras.get_segmentation(level="actor", return_raw=True)
+                )
+                for camera_name in actor_segmentation_raw.keys():
+                    pkl_dic["observation"][camera_name]["actor_segmentation_raw"] = (
+                        actor_segmentation_raw[camera_name]["actor_segmentation"]
+                    )
         # depth
         if self.data_type.get("depth", False):
-            depth = self.cameras.get_depth()
+            depth = self._filter_camera_map(self.cameras.get_depth())
             for camera_name in depth.keys():
                 pkl_dic["observation"][camera_name].update(depth[camera_name])
         # endpose
         if self.data_type.get("endpose", False):
-            if not self.is_dual_arm:
-                norm_gripper_val = self.robot.get_left_gripper_val()
-                left_endpose = self.get_arm_pose("left")
-                pkl_dic["endpose"]["endpose"] = left_endpose
-                pkl_dic["endpose"]["gripper"] = norm_gripper_val
-            else:
-                norm_gripper_val = [self.robot.get_left_gripper_val(), self.robot.get_right_gripper_val()]
-                left_endpose = self.get_arm_pose("left")
-                right_endpose = self.get_arm_pose("right")
-                pkl_dic["endpose"]["left_endpose"] = left_endpose
-                pkl_dic["endpose"]["left_gripper"] = norm_gripper_val[0]
-                pkl_dic["endpose"]["right_endpose"] = right_endpose
-                pkl_dic["endpose"]["right_gripper"] = norm_gripper_val[1]
+            norm_gripper_val = [
+                self.robot.get_left_gripper_val(),
+                self.robot.get_right_gripper_val(),
+            ]
+            left_endpose = self.get_arm_pose("left")
+            right_endpose = self.get_arm_pose("right")
+            pkl_dic["endpose"]["left_endpose"] = left_endpose
+            pkl_dic["endpose"]["left_gripper"] = norm_gripper_val[0]
+            pkl_dic["endpose"]["right_endpose"] = right_endpose
+            pkl_dic["endpose"]["right_gripper"] = norm_gripper_val[1]
         # qpos
         if self.data_type.get("qpos", False):
-            
-            if not self.is_dual_arm:
-                left_jointstate = self.robot.get_left_arm_jointState()
-                pkl_dic["joint_action"]["arm"] = left_jointstate[:-1]
-                pkl_dic["joint_action"]["gripper"] = left_jointstate[-1]
-                pkl_dic["joint_action"]["vector"] = np.array(left_jointstate)
-            else:
-                left_jointstate = self.robot.get_left_arm_jointState()
-                right_jointstate = self.robot.get_right_arm_jointState()
 
-                pkl_dic["joint_action"]["left_arm"] = left_jointstate[:-1]
-                pkl_dic["joint_action"]["left_gripper"] = left_jointstate[-1]
-                pkl_dic["joint_action"]["right_arm"] = right_jointstate[:-1]
-                pkl_dic["joint_action"]["right_gripper"] = right_jointstate[-1]
-                pkl_dic["joint_action"]["vector"] = np.array(left_jointstate + right_jointstate)
+            left_jointstate = self.robot.get_left_arm_jointState()
+            right_jointstate = self.robot.get_right_arm_jointState()
+
+            pkl_dic["joint_action"]["left_arm"] = left_jointstate[:-1]
+            pkl_dic["joint_action"]["left_gripper"] = left_jointstate[-1]
+            pkl_dic["joint_action"]["right_arm"] = right_jointstate[:-1]
+            pkl_dic["joint_action"]["right_gripper"] = right_jointstate[-1]
+            pkl_dic["joint_action"]["vector"] = np.array(left_jointstate + right_jointstate)
         # pointcloud
         if self.data_type.get("pointcloud", False):
             pkl_dic["pointcloud"] = self.cameras.get_pcd(self.data_type.get("conbine", False))
@@ -525,14 +1399,39 @@ class Base_Task(gym.Env):
         rgb = self.cameras.get_rgb()
         save_img(save_path, rgb[camera_name]['rgb'])
 
+    def _resolve_rgb_camera_name(self):
+        observation = getattr(self, "now_obs", {}).get("observation", {})
+        if not isinstance(observation, dict):
+            return "head_camera"
+
+        preferred_names = [
+            getattr(self, "record_camera_name", None),
+            "head_camera",
+            "world_camera1",
+            "observer_camera",
+            "third_view_camera",
+            "third_view",
+        ]
+        for camera_name in preferred_names:
+            if camera_name and camera_name in observation and isinstance(observation[camera_name], dict):
+                if "rgb" in observation[camera_name]:
+                    return camera_name
+
+        for camera_name, camera_data in observation.items():
+            if isinstance(camera_data, dict) and "rgb" in camera_data:
+                return camera_name
+
+        return "head_camera"
+
     def _take_picture(self):  # save data
         if not self.save_data:
             return
-        
-        self.language_annotation_cache += 1
+
+        print("saving: episode = ", self.ep_num, " index = ", self.FRAME_IDX, end="\r")
 
         if self.FRAME_IDX == 0:
             self.folder_path = {"cache": f"{self.save_dir}/.cache/episode{self.ep_num}/"}
+
             for directory in self.folder_path.values():  # remove previous data
                 if os.path.exists(directory):
                     file_list = os.listdir(directory)
@@ -567,7 +1466,47 @@ class Base_Task(gym.Env):
         # print('Merging pkl to hdf5: ', cache_path, ' -> ', target_file_path)
 
         os.makedirs(f"{self.save_dir}/data", exist_ok=True)
-        process_folder_to_hdf5_video(cache_path, target_file_path, target_video_path)
+        sidecar_root = os.path.splitext(target_file_path)[0] + "_npy" if self.enable_h5_sidecar_export else None
+        process_folder_to_hdf5_video(
+            cache_path,
+            target_file_path,
+            target_video_path,
+            video_fps=self.video_fps,
+            sidecar_root=sidecar_root,
+            record_single_camera=self.record_single_camera,
+            selected_camera_name=self.selected_camera_name,
+            segmentation_level=self.segmentation_level,
+            strip_h5_rgb=self.strip_h5_rgb,
+            strip_h5_extrinsic=self.strip_h5_extrinsic,
+            export_h5_depth_to_sidecar=self.export_h5_depth_to_sidecar,
+            export_h5_intrinsic_to_sidecar=self.export_h5_intrinsic_to_sidecar,
+            export_h5_cam_pose_to_sidecar=self.export_h5_cam_pose_to_sidecar,
+            export_h5_segmentation_to_sidecar=self.export_h5_segmentation_to_sidecar,
+            strip_h5_segmentation=self.strip_h5_segmentation,
+        )
+
+        self._append_mesh_to_episode_hdf5(target_file_path)
+        if self.enable_h5_sidecar_export:
+            # Mirror rgb video into per-camera sidecar directory as rgb.mp4.
+            camera_name = getattr(self, "selected_camera_name", None) or getattr(self, "record_camera_name", "world_camera1")
+            camera_sidecar_dir = os.path.splitext(target_file_path)[0] + f"_npy/observation/{camera_name}"
+            os.makedirs(camera_sidecar_dir, exist_ok=True)
+            rgb_alias_path = os.path.join(camera_sidecar_dir, "rgb.mp4")
+            try:
+                if os.path.exists(rgb_alias_path):
+                    os.remove(rgb_alias_path)
+                os.link(target_video_path, rgb_alias_path)
+            except Exception:
+                shutil.copy2(target_video_path, rgb_alias_path)
+
+        # Keep a trajectory-style alias while preserving the original episodeN.hdf5 path.
+        traj_alias_path = f"{self.save_dir}/data/traj_{self.ep_num}.h5"
+        try:
+            if os.path.exists(traj_alias_path):
+                os.remove(traj_alias_path)
+            os.link(target_file_path, traj_alias_path)
+        except Exception:
+            shutil.copy2(target_file_path, traj_alias_path)
 
     def remove_data_cache(self):
         folder_path = self.folder_path["cache"]
@@ -607,7 +1546,7 @@ class Base_Task(gym.Env):
             self.eval_video_ffmpeg.wait()
             del self.eval_video_ffmpeg
 
-    def delay(self, delay_time, save_freq=None, language_annotation=None):
+    def delay(self, delay_time, save_freq=None):
         render_freq = self.render_freq
         self.render_freq = 0
 
@@ -621,9 +1560,6 @@ class Base_Task(gym.Env):
             )
 
         self.render_freq = render_freq
-        if language_annotation is not None:
-            self.language_annotation.append([language_annotation, self.language_annotation_cache])
-            self.language_annotation_cache = 0
 
     def set_gripper(self, set_tag="together", left_pos=None, right_pos=None):
         """
@@ -728,45 +1664,24 @@ class Base_Task(gym.Env):
     # =========================================================== Our APIS ===========================================================
 
     def together_close_gripper(self, save_freq=-1, left_pos=0, right_pos=0):
-        if not self.is_dual_arm:
-            left_result = self.set_gripper(left_pos=left_pos, set_tag="left")
-            control_seq = {
-                "left_arm": None,
-                "left_gripper": left_result,
-                "right_arm": None,
-                "right_gripper": None,
-            }
-            self.take_dense_action(control_seq, save_freq=save_freq)
-        else:
-            left_result, right_result = self.set_gripper(left_pos=left_pos, right_pos=right_pos, set_tag="together")
-            control_seq = {
-                "left_arm": None,
-                "left_gripper": left_result,
-                "right_arm": None,
-                "right_gripper": right_result,
-            }
-            self.take_dense_action(control_seq, save_freq=save_freq)
+        left_result, right_result = self.set_gripper(left_pos=left_pos, right_pos=right_pos, set_tag="together")
+        control_seq = {
+            "left_arm": None,
+            "left_gripper": left_result,
+            "right_arm": None,
+            "right_gripper": right_result,
+        }
+        self.take_dense_action(control_seq, save_freq=save_freq)
 
     def together_open_gripper(self, save_freq=-1, left_pos=1, right_pos=1):
-        if not self.is_dual_arm:
-            left_result = self.set_gripper(left_pos=left_pos, set_tag="left")
-            control_seq = {
-                "left_arm": None,
-                "left_gripper": left_result,
-                "right_arm": None,
-                "right_gripper": None,
-            }
-            self.take_dense_action(control_seq, save_freq=save_freq)
-        else:
-            left_result, right_result = self.set_gripper(left_pos=left_pos, right_pos=right_pos, set_tag="together")
-            control_seq = {
-                "left_arm": None,
-                "left_gripper": left_result,
-                "right_arm": None,
-                "right_gripper": right_result,
-            }
-            self.take_dense_action(control_seq, save_freq=save_freq)
-
+        left_result, right_result = self.set_gripper(left_pos=left_pos, right_pos=right_pos, set_tag="together")
+        control_seq = {
+            "left_arm": None,
+            "left_gripper": left_result,
+            "right_arm": None,
+            "right_gripper": right_result,
+        }
+        self.take_dense_action(control_seq, save_freq=save_freq)
 
     def left_move_to_pose(
         self,
@@ -929,7 +1844,7 @@ class Base_Task(gym.Env):
         actions_by_arm1: tuple[ArmTag, list[Action]],
         actions_by_arm2: tuple[ArmTag, list[Action]] = None,
         save_freq=-1,
-        language_annotation=None
+        **kwargs,
     ):
         """
         Take action for the robot.
@@ -1008,9 +1923,7 @@ class Base_Task(gym.Env):
                         return False
 
             self.take_dense_action(control_seq)
-        if language_annotation is not None:
-            self.language_annotation.append([language_annotation, self.language_annotation_cache])
-            self.language_annotation_cache = 0
+
         return True
 
     def get_gripper_actor_contact_position(self, actor_name):
@@ -1528,8 +2441,8 @@ class Base_Task(gym.Env):
 
         eval_video_freq = 1  # fixed
         if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
-            # self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
-            self.eval_video_ffmpeg.stdin.write(self.now_obs["third_view_rgb"].tobytes())
+            camera_name = self._resolve_rgb_camera_name()
+            self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"][camera_name]["rgb"].tobytes())
 
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
@@ -1539,18 +2452,19 @@ class Base_Task(gym.Env):
             self.viewer.render()
 
         actions = np.array([action])
-        if not self.is_dual_arm:
-            left_jointstate = self.robot.get_left_arm_jointState()
-            left_arm_dim = len(left_jointstate) - 1 if action_type == 'qpos' else 7
-            current_jointstate = np.array(left_jointstate)
-        else:
-            left_jointstate = self.robot.get_left_arm_jointState()
-            left_arm_dim = len(left_jointstate) - 1 if action_type == 'qpos' else 7
-            right_jointstate = self.robot.get_right_arm_jointState()
-            right_arm_dim = len(right_jointstate) - 1 if action_type == 'qpos' else 7
-            current_jointstate = np.array(left_jointstate + right_jointstate)
+        left_jointstate = self.robot.get_left_arm_jointState()
+        right_jointstate = self.robot.get_right_arm_jointState()
+        left_arm_dim = len(left_jointstate) - 1 if action_type == 'qpos' else 7
+        right_arm_dim = len(right_jointstate) - 1 if action_type == 'qpos' else 7
+        current_jointstate = np.array(left_jointstate + right_jointstate)
 
         left_arm_actions, left_gripper_actions, left_current_qpos, left_path = (
+            [],
+            [],
+            [],
+            [],
+        )
+        right_arm_actions, right_gripper_actions, right_current_qpos, right_path = (
             [],
             [],
             [],
@@ -1561,22 +2475,17 @@ class Base_Task(gym.Env):
             actions[:, :left_arm_dim],
             actions[:, left_arm_dim],
         )
-        left_current_gripper = self.robot.get_left_gripper_val()
-        left_gripper_path = np.hstack((left_current_gripper, left_gripper_actions))
+        right_arm_actions, right_gripper_actions = (
+            actions[:, left_arm_dim + 1:left_arm_dim + right_arm_dim + 1],
+            actions[:, left_arm_dim + right_arm_dim + 1],
+        )
+        left_current_gripper, right_current_gripper = (
+            self.robot.get_left_gripper_val(),
+            self.robot.get_right_gripper_val(),
+        )
 
-        if self.is_dual_arm:
-            right_arm_actions, right_gripper_actions, right_current_qpos, right_path = (
-                [],
-                [],
-                [],
-                [],
-            )
-            right_arm_actions, right_gripper_actions = (
-                actions[:, left_arm_dim + 1:left_arm_dim + right_arm_dim + 1],
-                actions[:, left_arm_dim + right_arm_dim + 1],
-            )
-            right_current_gripper = self.robot.get_right_gripper_val()
-            right_gripper_path = np.hstack((right_current_gripper, right_gripper_actions))
+        left_gripper_path = np.hstack((left_current_gripper, left_gripper_actions))
+        right_gripper_path = np.hstack((right_current_gripper, right_gripper_actions))
 
         if action_type == 'qpos':
             left_current_qpos, right_current_qpos = (
@@ -1606,26 +2515,26 @@ class Base_Task(gym.Env):
                 topp_left_flag = False
                 left_n_step = 50  # fixed
 
-            if self.is_dual_arm:
-                try:
-                    times, right_pos, right_vel, acc, duration = (self.robot.right_mplib_planner.TOPP(right_path,
-                                                                                                    1 / 250,
-                                                                                                    verbose=True))
-                    right_result = dict()
-                    right_result["position"], right_result["velocity"] = right_pos, right_vel
-                    right_n_step = right_result["position"].shape[0]
-                except Exception as e:
-                    # print("right arm TOPP error: ", e)
-                    topp_right_flag = False
-                    right_n_step = 50  # fixed
+            try:
+                times, right_pos, right_vel, acc, duration = (self.robot.right_mplib_planner.TOPP(right_path,
+                                                                                                1 / 250,
+                                                                                                verbose=True))
+                right_result = dict()
+                right_result["position"], right_result["velocity"] = right_pos, right_vel
+                right_n_step = right_result["position"].shape[0]
+            except Exception as e:
+                # print("right arm TOPP error: ", e)
+                topp_right_flag = False
+                right_n_step = 50  # fixed
 
-                if right_n_step == 0:
-                    topp_right_flag = False
-                    right_n_step = 50  # fixed
+            if right_n_step == 0:
+                topp_right_flag = False
+                right_n_step = 50  # fixed
         
         elif action_type == 'ee':
 
             left_result = self.robot.left_plan_path(left_arm_actions[0])
+            right_result = self.robot.right_plan_path(right_arm_actions[0])
             if left_result["status"] != "Success":
                 left_n_step = 50
                 topp_left_flag = False
@@ -1634,30 +2543,26 @@ class Base_Task(gym.Env):
                 left_n_step = left_result["position"].shape[0]
                 topp_left_flag = True
             
-            if self.is_dual_arm:
-                right_result = self.robot.right_plan_path(right_arm_actions[0])
-                if right_result["status"] != "Success":
-                    right_n_step = 50
-                    topp_right_flag = False
-                    # print("right fail")
-                else:
-                    right_n_step = right_result["position"].shape[0]
-                    topp_right_flag = True
+            if right_result["status"] != "Success":
+                right_n_step = 50
+                topp_right_flag = False
+                # print("right fail")
+            else:
+                right_n_step = right_result["position"].shape[0]
+                topp_right_flag = True
 
         # ========== Gripper ==========
 
         left_mod_num = left_n_step % len(left_gripper_actions)
-        if self.is_dual_arm:
-            right_mod_num = right_n_step % len(right_gripper_actions)
+        right_mod_num = right_n_step % len(right_gripper_actions)
         left_gripper_step = [0] + [
             left_n_step // len(left_gripper_actions) + (1 if i < left_mod_num else 0)
             for i in range(len(left_gripper_actions))
         ]
-        if self.is_dual_arm:
-            right_gripper_step = [0] + [
-                right_n_step // len(right_gripper_actions) + (1 if i < right_mod_num else 0)
-                for i in range(len(right_gripper_actions))
-            ]
+        right_gripper_step = [0] + [
+            right_n_step // len(right_gripper_actions) + (1 if i < right_mod_num else 0)
+            for i in range(len(right_gripper_actions))
+        ]
 
         left_gripper = []
         for gripper_step in range(1, left_gripper_path.shape[0]):
@@ -1669,24 +2574,22 @@ class Base_Task(gym.Env):
             left_gripper = left_gripper + region_left_gripper.tolist()
         left_gripper = np.array(left_gripper)
 
-        if self.is_dual_arm:
-            right_gripper = []
-            for gripper_step in range(1, right_gripper_path.shape[0]):
-                region_right_gripper = np.linspace(
-                    right_gripper_path[gripper_step - 1],
-                    right_gripper_path[gripper_step],
-                    right_gripper_step[gripper_step] + 1,
-                )[1:]
-                right_gripper = right_gripper + region_right_gripper.tolist()
-            right_gripper = np.array(right_gripper)
+        right_gripper = []
+        for gripper_step in range(1, right_gripper_path.shape[0]):
+            region_right_gripper = np.linspace(
+                right_gripper_path[gripper_step - 1],
+                right_gripper_path[gripper_step],
+                right_gripper_step[gripper_step] + 1,
+            )[1:]
+            right_gripper = right_gripper + region_right_gripper.tolist()
+        right_gripper = np.array(right_gripper)
 
         now_left_id, now_right_id = 0, 0
 
         # ========== Control Loop ==========
-        while now_left_id < left_n_step or (self.is_dual_arm and now_right_id < right_n_step):
-            
-            if (now_left_id < left_n_step):
-            # if (now_left_id < left_n_step and now_left_id / left_n_step <= now_right_id / right_n_step):
+        while now_left_id < left_n_step or now_right_id < right_n_step:
+
+            if (now_left_id < left_n_step and now_left_id / left_n_step <= now_right_id / right_n_step):
                 if topp_left_flag:
                     self.robot.set_arm_joints(
                         left_result["position"][now_left_id],
@@ -1696,18 +2599,17 @@ class Base_Task(gym.Env):
                 self.robot.set_gripper(left_gripper[now_left_id], "left")
 
                 now_left_id += 1
-            
-            if self.is_dual_arm:
-                if (now_right_id < right_n_step and now_right_id / right_n_step <= now_left_id / left_n_step):
-                    if topp_right_flag:
-                        self.robot.set_arm_joints(
-                            right_result["position"][now_right_id],
-                            right_result["velocity"][now_right_id],
-                            "right",
-                        )
-                    self.robot.set_gripper(right_gripper[now_right_id], "right")
 
-                    now_right_id += 1
+            if (now_right_id < right_n_step and now_right_id / right_n_step <= now_left_id / left_n_step):
+                if topp_right_flag:
+                    self.robot.set_arm_joints(
+                        right_result["position"][now_right_id],
+                        right_result["velocity"][now_right_id],
+                        "right",
+                    )
+                self.robot.set_gripper(right_gripper[now_right_id], "right")
+
+                now_right_id += 1
 
             self.scene.step()
             self._update_render()
@@ -1716,7 +2618,8 @@ class Base_Task(gym.Env):
                 self.eval_success = True
                 self.get_obs() # update obs
                 if (self.eval_video_path is not None):
-                    self.eval_video_ffmpeg.stdin.write(self.now_obs["third_view_rgb"].tobytes())
+                    camera_name = self._resolve_rgb_camera_name()
+                    self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"][camera_name]["rgb"].tobytes())
                 return
 
         self._update_render()
@@ -1760,8 +2663,7 @@ class Base_Task(gym.Env):
             step_num = None
             step_description = step_name
 
-        # Only process head_camera
-        cam_name = "head_camera"
+        cam_name = self._resolve_rgb_camera_name()
         if cam_name in cam_obs:
             rgb = cam_obs[cam_name]["rgb"]
             if rgb.dtype != np.uint8:

@@ -22,3 +22,8 @@ LargeView:
   fovy: 50
   w: 320
   h: 240
+
+Custom_832x480:
+  fovy: 37
+  w: 832
+  h: 480

@@ -36,7 +36,16 @@ def get_embodiment_config(robot_file):
     return embodiment_args
 
 
-def main(task_name=None, task_config=None):
+def main(
+    task_name=None,
+    task_config=None,
+    episode_start=None,
+    episode_end=None,
+    scene_info_input=None,
+    override_use_seed=None,
+    override_collect_data=None,
+    override_episode_num=None,
+):
 
     task = class_decorator(task_name)
     config_path = f"./task_config/{task_config}.yml"
@@ -45,6 +54,26 @@ def main(task_name=None, task_config=None):
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
     args['task_name'] = task_name
+
+    if override_use_seed is not None:
+        args["use_seed"] = bool(override_use_seed)
+    if override_collect_data is not None:
+        args["collect_data"] = bool(override_collect_data)
+    if override_episode_num is not None:
+        args["episode_num"] = int(override_episode_num)
+
+    # Prefer external camera candidates produced by interactive picker.
+    camera_cfg = args.setdefault("camera", {})
+    if bool(camera_cfg.get("record_single_camera", False)):
+        record_camera_name = str(camera_cfg.get("record_camera_name", "world_camera1"))
+        auto_candidates_file = os.path.join(
+            "task_config",
+            "camera_candidates",
+            f"{task_config}_{record_camera_name}.yml",
+        )
+        if os.path.exists(auto_candidates_file):
+            camera_cfg["random_camera_candidates_file"] = auto_candidates_file
+            print(f"[INFO] Use camera candidates file: {auto_candidates_file}")
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -99,12 +128,14 @@ def main(task_name=None, task_config=None):
 
     args["embodiment_name"] = embodiment_name
     args['task_config'] = task_config
+    args["scene_info_input"] = scene_info_input
     args["save_path"] = os.path.join(args["save_path"], str(args["task_name"]), args["task_config"])
-    run(task, args)
+    run(task, args, episode_start=episode_start, episode_end=episode_end)
 
 
-def run(TASK_ENV, args):
+def run(TASK_ENV, args, episode_start=None, episode_end=None):
     epid, suc_num, fail_num, seed_list = 0, 0, 0, []
+    scene_info_db = None
 
     print(f"Task Name: \033[34m{args['task_name']}\033[0m")
 
@@ -175,9 +206,21 @@ def run(TASK_ENV, args):
         print(f"\nComplete simulation, failed \033[91m{fail_num}\033[0m times / {epid} tries \n")
     else:
         print("\033[93m" + "Use Saved Seeds List".center(30, "-") + "\033[0m")
-        with open(os.path.join(args["save_path"], "seed.txt"), "r") as file:
+        seed_file = os.path.join(args["save_path"], "seed.txt")
+        if not os.path.exists(seed_file):
+            raise RuntimeError(
+                f"seed file not found: {seed_file}. "
+                "Please generate seeds first (set use_seed=false or use --override-use-seed false)."
+            )
+        with open(seed_file, "r") as file:
             seed_list = file.read().split()
             seed_list = [int(i) for i in seed_list]
+
+        if len(seed_list) == 0:
+            raise RuntimeError(
+                f"seed file is empty: {seed_file}. "
+                "Please generate seeds first (set use_seed=false or use --override-use-seed false)."
+            )
 
     # =========== Collect Data ===========
 
@@ -190,59 +233,113 @@ def run(TASK_ENV, args):
 
         clear_cache_freq = args["clear_cache_freq"]
 
-        st_idx = 0
+        scene_info_input = args.get("scene_info_input")
+        if scene_info_input:
+            if os.path.isfile(scene_info_input):
+                with open(scene_info_input, "r", encoding="utf-8") as file:
+                    scene_info_db = json.load(file)
+                print(f"Use scene_info input: {scene_info_input}")
+            else:
+                print(f"[WARN] scene_info input not found, ignore: {scene_info_input}")
 
         def exist_hdf5(idx):
             file_path = os.path.join(args["save_path"], 'data', f'episode{idx}.hdf5')
             return os.path.exists(file_path)
 
-        while exist_hdf5(st_idx):
-            st_idx += 1
+        if episode_start is None and episode_end is None:
+            start_idx = 0
+            end_idx = args["episode_num"]
+        else:
+            start_idx = 0 if episode_start is None else max(0, int(episode_start))
+            end_idx = args["episode_num"] if episode_end is None else min(args["episode_num"], int(episode_end))
+            if end_idx <= start_idx:
+                print(f"Skip replay range [{start_idx}, {end_idx})")
+                return
 
-        language_annotation_json_path = os.path.join(args["save_path"], 'language_annotation.json')
+        if len(seed_list) <= start_idx:
+            raise RuntimeError(
+                f"Not enough seeds for replay range [{start_idx}, {end_idx}). "
+                f"seed_count={len(seed_list)}. "
+                "Generate more seeds first (set use_seed=false or use --override-use-seed false)."
+            )
 
-        for episode_idx in range(st_idx, args["episode_num"]):
-            print(f"\033[34mTask name: {args['task_name']}\033[0m")
+        if len(seed_list) < end_idx:
+            print(
+                f"[WARN] seed count ({len(seed_list)}) is smaller than requested end ({end_idx}). "
+                f"Replay range will be truncated to [{start_idx}, {len(seed_list)})."
+            )
+            end_idx = len(seed_list)
 
-            TASK_ENV.setup_demo(now_ep_num=episode_idx, seed=seed_list[episode_idx], **args)
-
-            traj_data = TASK_ENV.load_tran_data(episode_idx)
-            args["left_joint_path"] = traj_data["left_joint_path"]
-            args["right_joint_path"] = traj_data["right_joint_path"]
-            TASK_ENV.set_path_lst(args)
-
+        # Use per-range scene_info file in parallel replay to avoid write races.
+        if episode_start is None and episode_end is None:
             info_file_path = os.path.join(args["save_path"], "scene_info.json")
+        else:
+            info_file_path = os.path.join(args["save_path"], f"scene_info_{start_idx}_{end_idx}.json")
 
-            if not os.path.exists(info_file_path):
-                with open(info_file_path, "w", encoding="utf-8") as file:
-                    json.dump({}, file, ensure_ascii=False)
-
-            with open(info_file_path, "r", encoding="utf-8") as file:
-                info_db = json.load(file)
-
-            info = TASK_ENV.play_once()
-            info_db[f"episode_{episode_idx}"] = info
-
+        if not os.path.exists(info_file_path):
             with open(info_file_path, "w", encoding="utf-8") as file:
-                json.dump(info_db, file, ensure_ascii=False, indent=4)
-            
-            # language annotation
-            if not os.path.exists(language_annotation_json_path):
-                with open(language_annotation_json_path, "w", encoding="utf-8") as file:
-                    json.dump({}, file, ensure_ascii=False)
-            with open(language_annotation_json_path, "r", encoding="utf-8") as file:
-                language_annotation = json.load(file)
-            language_annotation[f'episode_{episode_idx}'] = TASK_ENV.language_annotation
-            with open(language_annotation_json_path, "w", encoding="utf-8") as file:
-                json.dump(language_annotation, file, ensure_ascii=False, indent=4)
+                json.dump({}, file, ensure_ascii=False)
 
-            TASK_ENV.close_env(clear_cache=((episode_idx + 1) % clear_cache_freq == 0))
-            TASK_ENV.merge_pkl_to_hdf5_video()
-            TASK_ENV.remove_data_cache()
-            assert TASK_ENV.check_success(), "Collect Error"
+        failed_episodes = []
 
-        command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"
-        os.system(command)
+        for episode_idx in range(start_idx, end_idx):
+            print(f"\033[34mTask name: {args['task_name']}\033[0m")
+            if exist_hdf5(episode_idx):
+                print(f"Skip existing hdf5 for episode {episode_idx}")
+                continue
+            try:
+                if scene_info_db is not None:
+                    args["scene_info_episode"] = scene_info_db.get(f"episode_{episode_idx}")
+                else:
+                    args["scene_info_episode"] = None
+
+                TASK_ENV.setup_demo(now_ep_num=episode_idx, seed=seed_list[episode_idx], **args)
+
+                traj_data = TASK_ENV.load_tran_data(episode_idx)
+                args["left_joint_path"] = traj_data["left_joint_path"]
+                args["right_joint_path"] = traj_data["right_joint_path"]
+                TASK_ENV.set_path_lst(args)
+
+                with open(info_file_path, "r", encoding="utf-8") as file:
+                    info_db = json.load(file)
+
+                info = TASK_ENV.play_once()
+                info_db[f"episode_{episode_idx}"] = info
+
+                with open(info_file_path, "w", encoding="utf-8") as file:
+                    json.dump(info_db, file, ensure_ascii=False, indent=4)
+
+                TASK_ENV.close_env(clear_cache=((episode_idx + 1) % clear_cache_freq == 0))
+                TASK_ENV.merge_pkl_to_hdf5_video()
+                TASK_ENV.remove_data_cache()
+
+                if not TASK_ENV.check_success():
+                    print(f"Collect Error at episode {episode_idx}, skip")
+                    failed_episodes.append(episode_idx)
+            except Exception as e:
+                import traceback
+                print(" -------------")
+                print(f"collect data episode {episode_idx} fail")
+                print("Error: ", e)
+                traceback.print_exc()
+                print(" -------------")
+                failed_episodes.append(episode_idx)
+                try:
+                    TASK_ENV.close_env(clear_cache=True)
+                except Exception:
+                    pass
+                time.sleep(0.3)
+                continue
+
+        if failed_episodes:
+            raise RuntimeError(
+                f"Collection failed for episodes: {failed_episodes}. "
+                "Please check logs above for the first exception."
+            )
+
+        if episode_start is None and episode_end is None:
+            command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"
+            os.system(command)
 
 
 if __name__ == "__main__":
@@ -252,11 +349,42 @@ if __name__ == "__main__":
     import torch.multiprocessing as mp
     mp.set_start_method("spawn", force=True)
 
+    def str2bool(v):
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in ("1", "true", "t", "yes", "y", "on"):
+            return True
+        if s in ("0", "false", "f", "no", "n", "off"):
+            return False
+        raise ValueError(f"Invalid bool value: {v}")
+
     parser = ArgumentParser()
     parser.add_argument("task_name", type=str)
     parser.add_argument("task_config", type=str)
+    parser.add_argument("--episode-start", type=int, default=None)
+    parser.add_argument("--episode-end", type=int, default=None)
+    parser.add_argument("--scene-info-input", type=str, default=None)
+    parser.add_argument("--override-use-seed", type=str, default=None)
+    parser.add_argument("--override-collect-data", type=str, default=None)
+    parser.add_argument("--override-episode-num", type=int, default=None)
     parser = parser.parse_args()
     task_name = parser.task_name
     task_config = parser.task_config
+    episode_start = parser.episode_start
+    episode_end = parser.episode_end
+    scene_info_input = parser.scene_info_input
+    override_use_seed = None if parser.override_use_seed is None else str2bool(parser.override_use_seed)
+    override_collect_data = None if parser.override_collect_data is None else str2bool(parser.override_collect_data)
+    override_episode_num = parser.override_episode_num
 
-    main(task_name=task_name, task_config=task_config)
+    main(
+        task_name=task_name,
+        task_config=task_config,
+        episode_start=episode_start,
+        episode_end=episode_end,
+        scene_info_input=scene_info_input,
+        override_use_seed=override_use_seed,
+        override_collect_data=override_collect_data,
+        override_episode_num=override_episode_num,
+    )

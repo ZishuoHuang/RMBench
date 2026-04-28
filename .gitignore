@@ -28,4 +28,6 @@ envs/curobo/*
 /config.json
 
 /*.json*
-/*.txt
+/*.txt.venv/
+logs/
+rmbench_mesh_probe_*/

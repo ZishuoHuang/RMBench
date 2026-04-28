@@ -27,6 +27,8 @@ class Robot:
         # self.dual_arm = dual_arm_tag
         # self.plan_success = True
 
+        dual_arm = bool(kwargs.get("dual_arm", kwargs.get("dual_arm_embodied", True)))
+
         self.left_js = None
         self.right_js = None
 
@@ -64,7 +66,7 @@ class Robot:
         _entity_origion_pose = sapien.Pose(_entity_origion_pose[:3], _entity_origion_pose[-4:])
         self.left_entity_origion_pose = deepcopy(_entity_origion_pose)
 
-        if kwargs['dual_arm']:
+        if dual_arm:
             self.right_urdf_path = os.path.join(right_robot_file, right_embodiment_args["urdf_path"])
             self.right_srdf_path = right_embodiment_args.get("srdf_path", None)
             if self.right_srdf_path is not None:
@@ -93,8 +95,8 @@ class Robot:
             _entity_origion_pose = sapien.Pose(_entity_origion_pose[:3], _entity_origion_pose[-4:])
             self.right_entity_origion_pose = deepcopy(_entity_origion_pose)
         
-        self.dual_arm_embodied = kwargs["dual_arm_embodied"]
-        self.is_dual_arm = kwargs['dual_arm']
+        self.dual_arm_embodied = bool(kwargs.get("dual_arm_embodied", True))
+        self.is_dual_arm = dual_arm
 
         self.left_rotate_lim = left_embodiment_args.get("rotate_lim", [0, 0])
         self.right_rotate_lim = right_embodiment_args.get("rotate_lim", [0, 0])
@@ -104,7 +106,7 @@ class Robot:
         self.right_perfect_direction = right_embodiment_args.get("grasp_perfect_direction",
                                                                  ["front_right", "front_left"])[1]
 
-        if not kwargs['dual_arm']:
+        if not dual_arm:
             loader: sapien.URDFLoader = scene.create_urdf_loader()
             loader.fix_root_link = True
 

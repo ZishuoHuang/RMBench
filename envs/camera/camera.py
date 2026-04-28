@@ -57,6 +57,14 @@ class Camera:
 
         self.collect_head_camera = kwags["camera"].get("collect_head_camera", True)
         self.collect_wrist_camera = kwags["camera"].get("collect_wrist_camera", True)
+        self.collect_observer_camera = kwags["camera"].get("collect_observer_camera", False)
+        self.collect_world_camera = kwags["camera"].get("collect_world_camera", False)
+        self.world_camera1_width = int(kwags["camera"].get("world_camera1_width", 640))
+        self.world_camera1_height = int(kwags["camera"].get("world_camera1_height", 480))
+        self.world_camera1_fovy = float(kwags["camera"].get("world_camera1_fovy", 50.0))
+        self.world_camera2_width = int(kwags["camera"].get("world_camera2_width", self.world_camera1_width))
+        self.world_camera2_height = int(kwags["camera"].get("world_camera2_height", self.world_camera1_height))
+        self.world_camera2_fovy = float(kwags["camera"].get("world_camera2_fovy", self.world_camera1_fovy))
 
         # embodiment = kwags.get('embodiment')
         # embodiment_config_path = os.path.join(CONFIGS_PATH, '_embodiment_config.yml')
@@ -216,31 +224,31 @@ class Camera:
                 # self.static_sensor_camera_list.append(sensor_camera)
                 self.static_camera_config.append(camera_config)
 
-        # third_view camera
-        self.third_view_camera = scene.add_camera(
-            name="third_view_camera",
+        # observer camera
+        self.observer_camera = scene.add_camera(
+            name="observer_camera",
             width=320,
             height=240,
-            fovy=np.deg2rad(70), #93
+            fovy=np.deg2rad(93),
             near=near,
             far=far,
         )
-        third_view_cam_pos = np.array([0.0, 0.23, 1.33]) #[0.0, 0.23, 1.33]
-        third_view_cam_forward = np.array([0, -0.9, -0.75]) #[0, -1, -1.02]
-        # third_view_cam_left = np.array([1,-1, 0])
-        third_view_cam_left = np.array([1, 0, 0])
-        third_view_up = np.cross(third_view_cam_forward, third_view_cam_left)
-        third_view_mat44 = np.eye(4)
-        third_view_mat44[:3, :3] = np.stack([third_view_cam_forward, third_view_cam_left, third_view_up], axis=1)
-        third_view_mat44[:3, 3] = third_view_cam_pos
-        self.third_view_camera.entity.set_pose(sapien.Pose(third_view_mat44))
+        observer_cam_pos = np.array([0.0, 0.23, 1.33])
+        observer_cam_forward = np.array([0, -1, -1.02])
+        # observer_cam_left = np.array([1,-1, 0])
+        observer_cam_left = np.array([1, 0, 0])
+        observer_up = np.cross(observer_cam_forward, observer_cam_left)
+        observer_mat44 = np.eye(4)
+        observer_mat44[:3, :3] = np.stack([observer_cam_forward, observer_cam_left, observer_up], axis=1)
+        observer_mat44[:3, 3] = observer_cam_pos
+        self.observer_camera.entity.set_pose(sapien.Pose(observer_mat44))
 
         # world pcd camera
         self.world_camera1 = scene.add_camera(
             name="world_camera1",
-            width=640,
-            height=480,
-            fovy=np.deg2rad(50),
+            width=self.world_camera1_width,
+            height=self.world_camera1_height,
+            fovy=np.deg2rad(self.world_camera1_fovy),
             near=near,
             far=far,
         )
@@ -254,10 +262,10 @@ class Camera:
         self.world_camera1.entity.set_pose(sapien.Pose(world_cam_mat44))
 
         self.world_camera2 = scene.add_camera(
-            name="world_camera1",
-            width=640,
-            height=480,
-            fovy=np.deg2rad(50),
+            name="world_camera2",
+            width=self.world_camera2_width,
+            height=self.world_camera2_height,
+            fovy=np.deg2rad(self.world_camera2_fovy),
             near=near,
             far=far,
         )
@@ -279,19 +287,24 @@ class Camera:
         for camera in self.static_camera_list:
             camera.take_picture()
 
+        if self.collect_observer_camera:
+            self.observer_camera.take_picture()
+        if self.collect_world_camera:
+            self.world_camera1.take_picture()
+            self.world_camera2.take_picture()
+
         # ================================= sensor camera =================================
         # self.head_sensor.take_picture()
         # self.head_sensor.compute_depth()
 
-    def update_wrist_camera(self, left_pose, right_pose=None):
+    def update_wrist_camera(self, left_pose, right_pose):
         """
         Update rendering to refresh the camera's RGBD information
         (rendering must be updated even when disabled, otherwise data cannot be collected).
         """
         if self.collect_wrist_camera:
             self.left_camera.entity.set_pose(left_pose)
-            if right_pose is not None:
-                self.right_camera.entity.set_pose(right_pose)
+            self.right_camera.entity.set_pose(right_pose)
 
     def get_config(self) -> dict:
         res = {}
@@ -316,6 +329,12 @@ class Camera:
                     res[camera_name] = _get_config(camera)
             else:
                 res[camera_name] = _get_config(camera)
+
+        if self.collect_observer_camera:
+            res["observer_camera"] = _get_config(self.observer_camera)
+        if self.collect_world_camera:
+            res["world_camera1"] = _get_config(self.world_camera1)
+            res["world_camera2"] = _get_config(self.world_camera2)
         # ================================= sensor camera =================================
         # res['head_sensor'] = res['head_camera']
         # print(res)
@@ -359,23 +378,32 @@ class Camera:
             else:
                 res[camera_name] = {}
                 res[camera_name]["rgba"] = _get_rgba(camera)
+
+        if self.collect_observer_camera:
+            res["observer_camera"] = {}
+            res["observer_camera"]["rgba"] = _get_rgba(self.observer_camera)
+        if self.collect_world_camera:
+            res["world_camera1"] = {}
+            res["world_camera2"] = {}
+            res["world_camera1"]["rgba"] = _get_rgba(self.world_camera1)
+            res["world_camera2"]["rgba"] = _get_rgba(self.world_camera2)
         # ================================= sensor camera =================================
         # res['head_sensor']['rgb'] = _get_sensor_rgba(self.head_sensor)
 
         return res
 
-    def get_third_view_rgb(self) -> dict:
-        self.third_view_camera.take_picture()
+    def get_observer_rgb(self) -> dict:
+        self.observer_camera.take_picture()
 
         def _get_rgb(camera):
             camera_rgba = camera.get_picture("Color")
             camera_rgb_img = (camera_rgba * 255).clip(0, 255).astype("uint8")[:, :, :3]
             return camera_rgb_img
 
-        return _get_rgb(self.third_view_camera)
+        return _get_rgb(self.observer_camera)
 
     # Get Camera Segmentation
-    def get_segmentation(self, level="mesh") -> dict:
+    def get_segmentation(self, level="mesh", return_raw=False) -> dict:
 
         def _get_segmentation(camera, level="mesh"):
             # visual_id is the unique id of each visual shape
@@ -388,6 +416,14 @@ class Camera:
                 label0_image = seg_labels[..., 1].astype(np.uint8)  # actor-level
             return color_palette[label0_image]
 
+        def _get_raw_segmentation(camera, level="mesh"):
+            seg_labels = camera.get_picture("Segmentation")  # [H, W, 4]
+            if level == "mesh":
+                return seg_labels[..., 0].astype(np.int32)
+            elif level == "actor":
+                return seg_labels[..., 1].astype(np.int32)
+            raise ValueError(f"Unsupported segmentation level: {level}")
+
         res = {
             # 'left_camera':{},
             # 'right_camera':{}
@@ -396,17 +432,43 @@ class Camera:
         if self.collect_wrist_camera:
             res["left_camera"] = {}
             res["right_camera"] = {}
-            res["left_camera"][f"{level}_segmentation"] = _get_segmentation(self.left_camera, level=level)
-            res["right_camera"][f"{level}_segmentation"] = _get_segmentation(self.right_camera, level=level)
+            if return_raw:
+                res["left_camera"][f"{level}_segmentation"] = _get_raw_segmentation(self.left_camera, level=level)
+                res["right_camera"][f"{level}_segmentation"] = _get_raw_segmentation(self.right_camera, level=level)
+            else:
+                res["left_camera"][f"{level}_segmentation"] = _get_segmentation(self.left_camera, level=level)
+                res["right_camera"][f"{level}_segmentation"] = _get_segmentation(self.right_camera, level=level)
 
         for camera, camera_name in zip(self.static_camera_list, self.static_camera_name):
             if camera_name == "head_camera":
                 if self.collect_head_camera:
                     res[camera_name] = {}
-                    res[camera_name][f"{level}_segmentation"] = _get_segmentation(camera, level=level)
+                    if return_raw:
+                        res[camera_name][f"{level}_segmentation"] = _get_raw_segmentation(camera, level=level)
+                    else:
+                        res[camera_name][f"{level}_segmentation"] = _get_segmentation(camera, level=level)
             else:
                 res[camera_name] = {}
-                res[camera_name][f"{level}_segmentation"] = _get_segmentation(camera, level=level)
+                if return_raw:
+                    res[camera_name][f"{level}_segmentation"] = _get_raw_segmentation(camera, level=level)
+                else:
+                    res[camera_name][f"{level}_segmentation"] = _get_segmentation(camera, level=level)
+
+        if self.collect_observer_camera:
+            res["observer_camera"] = {}
+            if return_raw:
+                res["observer_camera"][f"{level}_segmentation"] = _get_raw_segmentation(self.observer_camera, level=level)
+            else:
+                res["observer_camera"][f"{level}_segmentation"] = _get_segmentation(self.observer_camera, level=level)
+        if self.collect_world_camera:
+            res["world_camera1"] = {}
+            res["world_camera2"] = {}
+            if return_raw:
+                res["world_camera1"][f"{level}_segmentation"] = _get_raw_segmentation(self.world_camera1, level=level)
+                res["world_camera2"][f"{level}_segmentation"] = _get_raw_segmentation(self.world_camera2, level=level)
+            else:
+                res["world_camera1"][f"{level}_segmentation"] = _get_segmentation(self.world_camera1, level=level)
+                res["world_camera2"][f"{level}_segmentation"] = _get_segmentation(self.world_camera2, level=level)
         return res
 
     # Get Camera Depth
@@ -444,6 +506,18 @@ class Camera:
                 res[camera_name] = {}
                 res[camera_name]["depth"] = _get_depth(camera)
                 res[camera_name]["depth"] *= rgba[camera_name]["rgba"][:, :, 3] / 255
+
+        if self.collect_observer_camera:
+            res["observer_camera"] = {}
+            res["observer_camera"]["depth"] = _get_depth(self.observer_camera)
+            res["observer_camera"]["depth"] *= rgba["observer_camera"]["rgba"][:, :, 3] / 255
+        if self.collect_world_camera:
+            res["world_camera1"] = {}
+            res["world_camera2"] = {}
+            res["world_camera1"]["depth"] = _get_depth(self.world_camera1)
+            res["world_camera2"]["depth"] = _get_depth(self.world_camera2)
+            res["world_camera1"]["depth"] *= rgba["world_camera1"]["rgba"][:, :, 3] / 255
+            res["world_camera2"]["depth"] *= rgba["world_camera2"]["rgba"][:, :, 3] / 255
         # res['head_sensor']['depth'] = _get_sensor_depth(self.head_sensor)
 
         return res

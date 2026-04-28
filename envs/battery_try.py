@@ -29,6 +29,7 @@ class battery_try(Base_Task):
             qpos=[0.707, -0.707, 0, 0],
             fix_root_link=False,
         )
+        self.battery1.set_name("018_battery_1")
         self.battery1.set_mass(0.01)
         self.battery2 = rand_create_sapien_urdf_obj(
             scene=self,
@@ -41,6 +42,7 @@ class battery_try(Base_Task):
             qpos=[0.707, -0.707, 0, 0],
             fix_root_link=False,
         )
+        self.battery2.set_name("018_battery_2")
         self.battery2.set_mass(0.01)
         self.target_pose1_p = self.battery_slot.get_pose().p + np.array([-0.02, 0.0, 0.0])
         self.target_pose2_p = self.battery_slot.get_pose().p + np.array([0.02, 0.0, 0.0])   
